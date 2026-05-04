@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 #
-# FlySeas Travels — One-command deployment
+# FlySeas Travels — Server deployment (Hostinger / cPanel / shared hosting)
 #
-#   ./deploy.sh              install + build + migrate + optimise (safe — keeps data)
-#   ./deploy.sh --seed       same as above, then run seeders
-#   ./deploy.sh --fresh      WIPES DB and reseeds (dangerous; asks confirmation)
-#   ./deploy.sh --start      run everything and start the server at the end
-#   ./deploy.sh --fresh --start
+# Workflow on the server:
+#   ./deploy.sh                git pull + composer + migrate + cache (safe)
+#   ./deploy.sh --seed         same + run seeders
+#   ./deploy.sh --fresh        WIPE DB and reseed (asks confirmation)
+#   ./deploy.sh --no-pull      skip git pull (already up-to-date)
+#   ./deploy.sh --with-dev     install dev composer packages too
 #
-# Compatible with macOS and Linux.
+# Frontend assets (Vite build) must be built LOCALLY first and committed
+# to git (public/build/*) since shared hosts don't have Node.
+#
+# Override binaries with env vars:
+#   PHP_BIN=/opt/alt/php84/usr/bin/php COMPOSER_BIN=/usr/local/bin/composer ./deploy.sh
 # ----------------------------------------------------------------------
 
 set -euo pipefail
-
-# Move to script directory regardless of where it's run from
 cd "$(dirname "$0")"
 
 # ─── Colours ────────────────────────────────────────────────────────────
@@ -26,18 +29,62 @@ warn()  { echo -e "  ${YELLOW}⚠${NC} $1"; }
 err()   { echo -e "  ${RED}✗${NC} $1"; }
 fatal() { err "$1"; exit 1; }
 
+# ─── Auto-detect PHP 8.2+ binary ────────────────────────────────────────
+detect_php() {
+    local candidates=(
+        /opt/alt/php84/usr/bin/php
+        /opt/alt/php83/usr/bin/php
+        /opt/alt/php82/usr/bin/php
+        /opt/cpanel/ea-php84/root/usr/bin/php
+        /opt/cpanel/ea-php83/root/usr/bin/php
+        /opt/cpanel/ea-php82/root/usr/bin/php
+        /usr/local/bin/php
+        /usr/bin/php
+        php
+    )
+    for c in "${candidates[@]}"; do
+        if command -v "$c" >/dev/null 2>&1; then
+            if "$c" -r 'exit(version_compare(PHP_VERSION,"8.2.0","<")?1:0);' >/dev/null 2>&1; then
+                echo "$c"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+detect_composer() {
+    local candidates=(
+        /usr/local/bin/composer
+        /usr/bin/composer
+        composer
+    )
+    for c in "${candidates[@]}"; do
+        if command -v "$c" >/dev/null 2>&1; then
+            echo "$c"; return 0
+        fi
+    done
+    if [[ -f composer.phar ]]; then
+        echo "composer.phar"; return 0
+    fi
+    return 1
+}
+
+PHP_BIN="${PHP_BIN:-$(detect_php || true)}"
+COMPOSER_BIN="${COMPOSER_BIN:-$(detect_composer || true)}"
+
 # ─── Flags ──────────────────────────────────────────────────────────────
 DO_SEED=false
 DO_FRESH=false
-DO_START=false
-SERVE_HOST="${SERVE_HOST:-0.0.0.0}"
-SERVE_PORT="${SERVE_PORT:-8000}"
+SKIP_GIT=false
+WITH_DEV=false
 
 for arg in "$@"; do
     case "$arg" in
-        --seed)   DO_SEED=true ;;
-        --fresh)  DO_FRESH=true ;;
-        --start)  DO_START=true ;;
+        --seed)      DO_SEED=true ;;
+        --fresh)     DO_FRESH=true ;;
+        --no-pull)   SKIP_GIT=true ;;
+        --with-dev)  WITH_DEV=true ;;
         -h|--help)
             grep -E "^# (  | )" "$0" | sed 's/^# //'
             exit 0
@@ -48,155 +95,130 @@ done
 
 echo -e "${CYAN}${BOLD}"
 echo "  ╔═══════════════════════════════════════════╗"
-echo "  ║   FlySeas Travels — Deployment Script     ║"
+echo "  ║   FlySeas Travels — Server Deployment     ║"
 echo "  ╚═══════════════════════════════════════════╝"
 echo -e "${NC}"
 
 # ─── 1. Pre-flight ──────────────────────────────────────────────────────
-step "Checking system dependencies"
+step "Checking environment"
 
-command -v php       >/dev/null 2>&1 || fatal "PHP not found. Install PHP 8.2+ (brew install php on macOS)"
-command -v composer  >/dev/null 2>&1 || fatal "Composer not found. Install Composer"
-command -v node      >/dev/null 2>&1 || fatal "Node not found. Install Node 18+ (brew install node)"
-command -v npm       >/dev/null 2>&1 || fatal "npm not found"
+[[ -n "$PHP_BIN"      ]] || fatal "PHP 8.2+ not found. Set PHP_BIN=/path/to/php to override."
+[[ -n "$COMPOSER_BIN" ]] || fatal "Composer not found. Set COMPOSER_BIN=/path/to/composer to override."
 
-PHP_VER=$(php -r 'echo PHP_VERSION;')
-NODE_VER=$(node --version)
-ok "PHP ${PHP_VER}"
-ok "Composer $(composer --version 2>/dev/null | awk '{print $3}')"
-ok "Node ${NODE_VER}"
+PHP_VER=$("$PHP_BIN" -r 'echo PHP_VERSION;')
+ok "PHP ${PHP_VER}  (${PHP_BIN})"
+ok "Composer       (${COMPOSER_BIN})"
 
-# Quick PHP version sanity (8.2+)
-if php -r 'exit(version_compare(PHP_VERSION, "8.2.0", "<") ? 1 : 0);' ; then :; else
-    warn "PHP ${PHP_VER} is below 8.2. Laravel 12 needs 8.2+ — install with: brew install php"
+# Quick PHP extension check
+for ext in pdo_mysql mbstring openssl tokenizer xml ctype json; do
+    "$PHP_BIN" -m | grep -qi "^${ext}$" || warn "PHP extension '${ext}' not loaded"
+done
+
+# ─── 2. Git pull ────────────────────────────────────────────────────────
+if [[ "$SKIP_GIT" != true ]]; then
+    if [[ -d .git ]]; then
+        step "Pulling latest code from git"
+        git fetch --quiet
+        BEHIND=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+        if [[ "$BEHIND" -gt 0 ]]; then
+            git pull --ff-only
+            ok "Pulled ${BEHIND} new commit(s)"
+        else
+            ok "Already up-to-date"
+        fi
+    else
+        warn "Not a git repository — skipping pull"
+    fi
 fi
 
-# ─── 2. Environment ─────────────────────────────────────────────────────
-step "Setting up .env"
+# ─── 3. Environment file ────────────────────────────────────────────────
+step "Verifying .env"
 
 if [[ ! -f .env ]]; then
     if [[ -f .env.example ]]; then
         cp .env.example .env
         ok ".env created from .env.example"
+        warn "Edit .env now with your DB credentials, then re-run"
+        exit 0
     else
-        fatal ".env.example not found — cannot bootstrap environment"
+        fatal ".env missing and .env.example not found"
     fi
 fi
 
-# Generate APP_KEY if blank
-if ! grep -qE '^APP_KEY=base64:' .env ; then
-    php artisan key:generate --force --ansi >/dev/null
-    ok "Application key generated"
+if ! grep -qE '^APP_KEY=base64:' .env; then
+    "$PHP_BIN" artisan key:generate --force --ansi >/dev/null
+    ok "APP_KEY generated"
 else
     ok "APP_KEY already set"
 fi
 
-# Read DB config from .env
-get_env() { grep -E "^$1=" .env | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'"; }
-DB_CONN=$(get_env DB_CONNECTION)
-DB_NAME=$(get_env DB_DATABASE)
-DB_HOST=$(get_env DB_HOST)
-DB_USER=$(get_env DB_USERNAME)
-DB_PASS=$(get_env DB_PASSWORD)
-DB_PORT=$(get_env DB_PORT)
+# ─── 4. Composer install ────────────────────────────────────────────────
+step "Installing PHP dependencies"
 
-ok "DB driver: ${DB_CONN:-sqlite}"
+COMPOSER_FLAGS=(--optimize-autoloader --no-interaction --prefer-dist --no-progress)
+if [[ "$WITH_DEV" == true ]]; then
+    ok "Including dev packages (--with-dev)"
+else
+    COMPOSER_FLAGS+=(--no-dev)
+fi
 
-# ─── 3. Database ────────────────────────────────────────────────────────
-step "Preparing database"
-
-case "${DB_CONN:-sqlite}" in
-    mysql)
-        if command -v mysql >/dev/null 2>&1; then
-            MYSQL_CMD=(mysql -h "${DB_HOST:-127.0.0.1}" -P "${DB_PORT:-3306}" -u "${DB_USER:-root}")
-            [[ -n "${DB_PASS:-}" ]] && MYSQL_CMD+=(-p"${DB_PASS}")
-            if "${MYSQL_CMD[@]}" -e "SELECT 1" >/dev/null 2>&1; then
-                "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-                ok "MySQL database '${DB_NAME}' ready"
-            else
-                warn "Could not connect to MySQL with .env credentials — make sure server is running"
-                warn "Try: brew services start mysql"
-            fi
-        else
-            warn "mysql CLI not installed; create '${DB_NAME}' manually"
-        fi
-        ;;
-    sqlite)
-        mkdir -p database
-        SQLITE_FILE="database/database.sqlite"
-        [[ -f "$SQLITE_FILE" ]] || touch "$SQLITE_FILE"
-        ok "SQLite file: ${SQLITE_FILE}"
-        ;;
-    *)
-        warn "Unrecognised DB_CONNECTION '${DB_CONN}' — skipping DB creation"
-        ;;
-esac
-
-# ─── 4. Composer ────────────────────────────────────────────────────────
-step "Installing PHP dependencies (production mode)"
-composer install \
-    --optimize-autoloader \
-    --no-dev \
-    --no-interaction \
-    --prefer-dist \
-    --no-progress 2>&1 | grep -E "(Installing|Generating|Loading)" | tail -3 || true
+# Composer may be a phar that needs PHP, or a binary
+if [[ "$COMPOSER_BIN" == *.phar ]]; then
+    "$PHP_BIN" "$COMPOSER_BIN" install "${COMPOSER_FLAGS[@]}" 2>&1 | tail -5
+else
+    "$PHP_BIN" "$COMPOSER_BIN" install "${COMPOSER_FLAGS[@]}" 2>&1 | tail -5 \
+        || "$COMPOSER_BIN" install "${COMPOSER_FLAGS[@]}" 2>&1 | tail -5
+fi
 ok "Composer install complete"
 
-# ─── 5. Frontend ────────────────────────────────────────────────────────
-step "Building frontend assets"
-if [[ -f package-lock.json ]]; then
-    npm ci --prefer-offline --no-audit --no-fund 2>&1 | tail -3 || npm install --no-audit --no-fund
-else
-    npm install --no-audit --no-fund 2>&1 | tail -3
-fi
-ok "npm packages installed"
-
-npm run build
-ok "Vite production build complete"
-
-# ─── 6. Storage / permissions ───────────────────────────────────────────
-step "Preparing storage and cache directories"
-mkdir -p storage/framework/{cache,sessions,views,testing} storage/logs bootstrap/cache
+# ─── 5. Storage / permissions ───────────────────────────────────────────
+step "Preparing writable directories"
+mkdir -p storage/framework/{cache,sessions,views} storage/logs bootstrap/cache
 chmod -R 775 storage bootstrap/cache 2>/dev/null || true
-ok "Directories ensured"
+ok "Directories ready"
 
 if [[ ! -L public/storage ]]; then
-    php artisan storage:link 2>&1 | tail -1 || true
-    ok "Storage symlink created"
-else
-    ok "Storage symlink exists"
+    "$PHP_BIN" artisan storage:link 2>&1 | tail -1 || warn "Could not create storage symlink"
 fi
 
-# ─── 7. Migrations ──────────────────────────────────────────────────────
-if [[ "$DO_FRESH" == "true" ]]; then
-    step "Wiping database and reseeding"
-    echo -ne "  ${YELLOW}This will DROP all tables in '${DB_NAME}'.${NC} Continue? [y/N] "
+# ─── 6. Migrations ──────────────────────────────────────────────────────
+if [[ "$DO_FRESH" == true ]]; then
+    DB_NAME=$(grep -E "^DB_DATABASE=" .env | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    step "Wiping database '${DB_NAME}' and reseeding"
+    echo -ne "  ${YELLOW}This will DROP ALL TABLES.${NC} Continue? [y/N] "
     read -r CONFIRM
     if [[ "${CONFIRM,,}" != "y" && "${CONFIRM,,}" != "yes" ]]; then
         warn "Aborted by user"
         exit 0
     fi
-    php artisan migrate:fresh --seed --force
+    "$PHP_BIN" artisan migrate:fresh --seed --force
     ok "Database wiped and seeded"
 else
     step "Running pending migrations"
-    php artisan migrate --force --no-interaction
+    "$PHP_BIN" artisan migrate --force --no-interaction
     ok "Migrations up to date"
 
-    if [[ "$DO_SEED" == "true" ]]; then
+    if [[ "$DO_SEED" == true ]]; then
         step "Running seeders"
-        php artisan db:seed --force --no-interaction
+        "$PHP_BIN" artisan db:seed --force --no-interaction
         ok "Seeders complete"
     fi
 fi
 
-# ─── 8. Optimisation ────────────────────────────────────────────────────
-step "Optimising Laravel for production"
-php artisan optimize:clear >/dev/null
-php artisan config:cache   >/dev/null && ok "Config cached"
-php artisan route:cache    >/dev/null && ok "Routes cached"
-php artisan view:cache     >/dev/null && ok "Views cached"
-php artisan event:cache    >/dev/null 2>&1 && ok "Events cached" || true
+# ─── 7. Cache rebuild ───────────────────────────────────────────────────
+step "Rebuilding Laravel caches"
+"$PHP_BIN" artisan optimize:clear >/dev/null
+"$PHP_BIN" artisan config:cache    >/dev/null && ok "Config cached"
+"$PHP_BIN" artisan route:cache     >/dev/null && ok "Routes cached"
+"$PHP_BIN" artisan view:cache      >/dev/null && ok "Views cached"
+"$PHP_BIN" artisan event:cache     >/dev/null 2>&1 && ok "Events cached" || true
+
+# ─── 8. Verify Vite manifest ────────────────────────────────────────────
+if [[ -f public/build/manifest.json ]]; then
+    ok "Vite build assets present"
+else
+    warn "public/build/manifest.json missing — run 'npm run build' locally and commit public/build/*"
+fi
 
 # ─── Done ───────────────────────────────────────────────────────────────
 echo
@@ -204,34 +226,7 @@ echo -e "${GREEN}${BOLD}╔═════════════════�
 echo -e "${GREEN}${BOLD}║   ✓ Deployment complete                   ║${NC}"
 echo -e "${GREEN}${BOLD}╚═══════════════════════════════════════════╝${NC}"
 echo
-
-if [[ "$DO_START" == "true" ]]; then
-    step "Starting server on http://${SERVE_HOST}:${SERVE_PORT}"
-    echo
-    echo -e "  ${CYAN}Public site:${NC} http://localhost:${SERVE_PORT}"
-    echo -e "  ${CYAN}Admin login:${NC} http://localhost:${SERVE_PORT}/admin/login"
-    echo -e "  ${CYAN}Default admin:${NC} admin@flyseastravels.com / flyseas2026"
-    echo
-    echo -e "  ${YELLOW}Press Ctrl+C to stop the server${NC}"
-    echo
-    exec php artisan serve --host="${SERVE_HOST}" --port="${SERVE_PORT}"
-else
-    echo -e "  ${BOLD}Next steps:${NC}"
-    echo
-    echo -e "  ${CYAN}Start the dev server:${NC}"
-    echo "    php artisan serve"
-    echo
-    echo -e "  ${CYAN}Or run this script with --start to launch immediately:${NC}"
-    echo "    ./deploy.sh --start"
-    echo
-    echo -e "  ${CYAN}URLs:${NC}"
-    echo "    Public site:  http://localhost:8000"
-    echo "    Admin login:  http://localhost:8000/admin/login"
-    echo "    Default:      admin@flyseastravels.com / flyseas2026"
-    echo
-    echo -e "  ${CYAN}Production hosting:${NC}"
-    echo "    Point your web server (nginx/apache) docroot at: $(pwd)/public"
-    echo "    Run php-fpm with PHP ${PHP_VER}"
-    echo "    Set APP_ENV=production and APP_DEBUG=false in .env"
-    echo
-fi
+APP_URL=$(grep -E "^APP_URL=" .env | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+[[ -n "$APP_URL" ]] && echo -e "  Site:        ${CYAN}${APP_URL}${NC}"
+[[ -n "$APP_URL" ]] && echo -e "  Admin login: ${CYAN}${APP_URL}/admin/login${NC}"
+echo
