@@ -36,7 +36,7 @@
     </div>
 @endif
 
-<form method="POST" action="{{ route('admin.packages.update', $package) }}">
+<form method="POST" action="{{ route('admin.packages.update', $package) }}" enctype="multipart/form-data">
     @csrf
     @method('PUT')
 
@@ -174,19 +174,16 @@
             <div class="form-card">
                 <div class="form-card-head">
                     <h3>Media</h3>
+                    <p>First image is the hero — drag to reorder</p>
                 </div>
                 <div class="form-card-body">
-                    <div class="field">
-                        <div class="field-label"><label for="hero_image">Hero Image URL</label></div>
-                        <input type="url" id="hero_image" name="hero_image" class="field-input"
-                               value="{{ old('hero_image', $package->hero_image) }}">
-                    </div>
-                    @if($package->hero_image)
-                        <div style="margin-top:12px;">
-                            <img src="{{ $package->hero_image }}" alt="Hero"
-                                 style="max-height:160px; border-radius:var(--fs-r-md); border:1px solid var(--fs-line); object-fit:cover; width:100%;">
-                        </div>
-                    @endif
+                    @php
+                        $existingImages = array_values(array_filter(array_merge(
+                            [$package->hero_image],
+                            $package->gallery_images ?? []
+                        )));
+                    @endphp
+                    @include('admin.packages._image-uploader', ['existing' => $existingImages])
                 </div>
             </div>
 

@@ -33,7 +33,7 @@
     </div>
 @endif
 
-<form method="POST" action="{{ route('admin.packages.store') }}">
+<form method="POST" action="{{ route('admin.packages.store') }}" enctype="multipart/form-data">
     @csrf
 
     <div class="form-grid">
@@ -171,14 +171,10 @@
             <div class="form-card">
                 <div class="form-card-head">
                     <h3>Media</h3>
+                    <p>First image is the hero — drag to reorder</p>
                 </div>
                 <div class="form-card-body">
-                    <div class="field">
-                        <div class="field-label"><label for="hero_image">Hero Image URL</label></div>
-                        <input type="url" id="hero_image" name="hero_image" class="field-input"
-                               value="{{ old('hero_image') }}"
-                               placeholder="https://images.unsplash.com/...">
-                    </div>
+                    @include('admin.packages._image-uploader', ['existing' => []])
                 </div>
             </div>
 

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(php -l app/Http/Controllers/Admin/PackageController.php)",
+      "Bash(php -l app/Models/Package.php)",
+      "Bash(php artisan *)",
+      "Bash(grep -rn 'name=\"hero_image\"\\\\|hero_image\"' resources/views/admin)",
+      "Bash(grep -rln \"hero_image\" resources/views)"
+    ]
+  }
+}

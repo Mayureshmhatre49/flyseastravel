@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Str;
 
 class Package extends Model
 {
@@ -34,6 +35,26 @@ class Package extends Model
     public function enquiries(): HasMany
     {
         return $this->hasMany(Enquiry::class);
+    }
+
+    /**
+     * Resolve an image source to an absolute URL.
+     * Uploaded images are stored as "/storage/..." paths; external images keep their
+     * full http(s) URL. Used for crawler-facing tags (JSON-LD, Open Graph).
+     */
+    public function imageUrl(?string $src): ?string
+    {
+        if (empty($src)) {
+            return null;
+        }
+
+        return Str::startsWith($src, ['http://', 'https://']) ? $src : url($src);
+    }
+
+    /** Hero image as an absolute URL (or null). */
+    public function getHeroImageUrlAttribute(): ?string
+    {
+        return $this->imageUrl($this->hero_image);
     }
 
     public function getFormattedPriceAttribute(): string

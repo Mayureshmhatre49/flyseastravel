@@ -3,15 +3,18 @@
 @section('title',           $package->meta_title)
 @section('meta_description', $package->meta_description)
 @section('meta_keywords',    $package->meta_keywords)
-@section('og_image',         $package->hero_image ?: asset('images/logo.png'))
+@section('og_image',         $package->hero_image_url ?: asset('images/logo.png'))
 @section('og_type',          'product')
 
 @section('head')
     @php
-        $images = array_values(array_filter(array_merge(
+        $images = collect(array_merge(
             [$package->hero_image],
             $package->gallery_images ?? []
-        )));
+        ))->filter()
+          ->map(fn ($src) => $package->imageUrl($src))
+          ->values()
+          ->all();
 
         $productSchema = [
             '@context'    => 'https://schema.org',
@@ -57,7 +60,7 @@
             '@type'           => 'TouristTrip',
             'name'            => $package->title,
             'description'     => $package->description ?: $package->overview,
-            'image'           => $package->hero_image,
+            'image'           => $package->hero_image_url,
             'tourBookingPage' => url()->current(),
             'touristType'     => ucfirst($package->category),
             'itinerary'       => [
